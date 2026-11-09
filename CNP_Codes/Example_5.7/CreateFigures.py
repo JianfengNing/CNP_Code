@@ -1,100 +1,78 @@
-import torch
-import torch.nn as nn
-import numpy as np
+"""Plot the saved reconstructions for Example 5.7 and report their errors."""
+
+import argparse
+from pathlib import Path
+
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-import matplotlib.gridspec as gridspec
-if torch.backends.mps.is_available():
-    device = torch.device('mps')
-elif torch.cuda.is_available():
-    device = torch.device('cuda')
-else:
-    device = torch.device('cpu')
-
-print(f"Using device: {device}")
-
-n_plot = 256
-filename = f"data/hybrid_inverse_problem.pth"
-loaded_data = torch.load(filename)
-C_exact = loaded_data['C_exa'].numpy().reshape(n_plot, n_plot)
-C_pred = loaded_data['C_pred'].numpy().reshape(n_plot, n_plot)
-F_exact = loaded_data['F_exa'].numpy().reshape(n_plot, n_plot)
-F_pred = loaded_data['F_pred'].numpy().reshape(n_plot, n_plot)
-X_1 = loaded_data['x_1'].cpu().numpy()
-X_2 = loaded_data['x_2'].cpu().numpy()
-
-error_C = (np.mean((C_pred-C_exact)**2)/np.mean(C_exact**2))**0.5
-error_F = (np.mean((F_pred-F_exact)**2)/np.mean(F_exact**2))**0.5
+import numpy as np
+import torch
 
 
-
-print(f'Error_sigma: {error_C:.6f}, Error_F: {error_F:.6f}, ')
-fig = plt.figure(figsize=(22, 5))
-
-ax = fig.add_subplot(1,4, 1, projection='3d')
-surf1 = ax.plot_surface(X_1, X_2, C_exact, cmap='inferno',
-                             rstride=2, cstride=2, alpha=0.9)
-ax.set_xlabel('X')
-ax.set_ylabel('Y')
-#ax1.set_zlabel('Control Value')
-ax.set_title('(a) Exact $\sigma$', pad=0)
-ax.view_init(elev=30, azim=250)  # 较低视角突出高度变化
-ax.grid(True, alpha=0.3)
-
-ax.set_xlim(-1, 1)
-ax.set_ylim(-1, 1)
-ax.set_xticks([-1, -0.5, 0, 0.5, 1])
-ax.set_yticks([-1, -0.5, 0, 0.5, 1])
-
-    # 第二个视角：强调细节特征
-ax = fig.add_subplot(1,4, 2, projection='3d')
-surf2 = ax.plot_surface(X_1, X_2, C_pred, cmap='inferno',
-                             rstride=2, cstride=2, alpha=0.9)
-ax.set_xlabel('X')
-ax.set_ylabel('Y')
-#ax2.set_zlabel('State Value')
-ax.set_title('(b) Numerical  $\sigma$\nRelative L2 Error: $1.01x10^{{-2}}$',pad=0)
-ax.view_init(elev=30, azim=250)  # 较低视角突出高度变化
-ax.grid(True, alpha=0.3)
-
-ax.set_xlim(-1, 1)
-ax.set_ylim(-1, 1)
-ax.set_xticks([-1, -0.5, 0, 0.5, 1])
-ax.set_yticks([-1, -0.5, 0, 0.5, 1])
+DATA_DIR = Path(__file__).resolve().parent / "data"
 
 
-ax = fig.add_subplot(1,4, 3, projection='3d')
-surf1 = ax.plot_surface(X_1, X_2, F_exact, cmap='inferno',
-                             rstride=2, cstride=2, alpha=0.9)
-ax.set_xlabel('X')
-ax.set_ylabel('Y')
-#ax1.set_zlabel('Control Value')
-ax.set_title('(c) Exact $f$', pad=0)
-ax.view_init(elev=30, azim=250)  # 较低视角突出高度变化
-ax.grid(True, alpha=0.3)
-
-ax.set_xlim(-1, 1)
-ax.set_ylim(-1, 1)
-ax.set_xticks([-1, -0.5, 0, 0.5, 1])
-ax.set_yticks([-1, -0.5, 0, 0.5, 1])
-
-ax = fig.add_subplot(1,4, 4, projection='3d')
-surf2 = ax.plot_surface(X_1, X_2, F_pred, cmap='inferno',
-                             rstride=2, cstride=2, alpha=0.9)
-ax.set_xlabel('X')
-ax.set_ylabel('Y')
-#ax2.set_zlabel('State Value')
-ax.set_title('(d) Numerical  $f$\nRelative L2 Error: $2.10x10^{{-2}}$',pad=0)
-ax.view_init(elev=30, azim=250)  # 较低视角突出高度变化
-ax.grid(True, alpha=0.3)
-ax.set_xlim(-1, 1)
-ax.set_ylim(-1, 1)
-ax.set_xticks([-1, -0.5, 0, 0.5, 1])
-ax.set_yticks([-1, -0.5, 0, 0.5, 1])
+def relative_l2_error(predicted, exact):
+    predicted = np.asarray(predicted, dtype=np.float64)
+    exact = np.asarray(exact, dtype=np.float64)
+    reference_norm = np.linalg.norm(exact.ravel())
+    if reference_norm == 0:
+        raise ValueError("Relative L2 error is undefined for a zero reference field.")
+    return np.linalg.norm((predicted - exact).ravel()) / reference_norm
 
 
+def create_figure(input_path, output_path):
+    data = torch.load(input_path, map_location="cpu", weights_only=True)
+    x = data["x_1"].numpy()
+    y = data["x_2"].numpy()
+    if x.ndim != 2 or x.shape != y.shape:
+        raise ValueError("Expected x_1 and x_2 to be matching two-dimensional grids.")
+
+    sigma_exact = data["C_exa"].numpy().reshape(x.shape)
+    sigma_pred = data["C_pred"].numpy().reshape(x.shape)
+    f_exact = data["F_exa"].numpy().reshape(x.shape)
+    f_pred = data["F_pred"].numpy().reshape(x.shape)
+
+    sigma_error = relative_l2_error(sigma_pred, sigma_exact)
+    f_error = relative_l2_error(f_pred, f_exact)
+    print(f"Relative L2 error (sigma) = {sigma_error:.6e}")
+    print(f"Relative L2 error (f)     = {f_error:.6e}")
+
+    panels = (
+        (r"(a) Exact $\sigma$", sigma_exact, None),
+        (r"(b) Numerical $\sigma$", sigma_pred, sigma_error),
+        (r"(c) Exact $f$", f_exact, None),
+        (r"(d) Numerical $f$", f_pred, f_error),
+    )
+    fig, axes = plt.subplots(1, 4, figsize=(22, 5), subplot_kw={"projection": "3d"})
+    for ax, (title, values, error) in zip(axes, panels):
+        ax.plot_surface(x, y, values, cmap="inferno", rstride=2, cstride=2, alpha=0.9)
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        if error is not None:
+            mantissa, exponent = f"{error:.2e}".split("e")
+            title += "\n" + rf"Relative $L^2$ error: ${mantissa}\times 10^{{{int(exponent)}}}$"
+        ax.set_title(title, pad=0)
+        ax.view_init(elev=30, azim=250)
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(-1, 1)
+        ax.set_ylim(-1, 1)
+        ax.set_xticks([-1, -0.5, 0, 0.5, 1])
+        ax.set_yticks([-1, -0.5, 0, 0.5, 1])
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved figure to {output_path}")
 
 
-plt.tight_layout()
-plt.savefig("data/hybrid_inv_prob.png", dpi=150, bbox_inches='tight')
-plt.close()
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", type=Path, default=DATA_DIR / "hybrid_inverse_problem.pth")
+    parser.add_argument("--output", type=Path, default=DATA_DIR / "hybrid_inv_prob.png")
+    args = parser.parse_args()
+    create_figure(args.input, args.output)
+
+
+if __name__ == "__main__":
+    main()
