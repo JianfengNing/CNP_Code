@@ -4,6 +4,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import math
 import os
+import json
+import argparse
 
 
 pi = math.pi
@@ -211,6 +213,122 @@ def sample_boundary(n_each: int, device=device) -> torch.Tensor:
     return torch.cat([s1, s2], dim=0)
 
 
+def lifting_diagnostic_points(interior_n=256, boundary_n=4096):
+    """Fixed evaluation grids, independent of the randomly varying training grid.
+
+    The interior grid has spacing 1/interior_n and excludes the whole boundary
+    of the open L-shaped domain. Gamma quadrature includes segment endpoints;
+    their inclusion does not change the continuous boundary integral.
+    """
+    if interior_n < 2 or boundary_n < 1:
+        raise ValueError("Require interior_n >= 2 and boundary_n >= 1.")
+    axis = np.arange(-interior_n + 1, interior_n, dtype=np.float64) / interior_n
+    xx, yy = np.meshgrid(axis, axis, indexing='ij')
+    inside = (xx < 0.0) | (yy > 0.0)
+    interior = np.column_stack((xx[inside], yy[inside]))
+
+    t = np.linspace(0.0, 1.0, boundary_n + 1)
+    horizontal = np.column_stack((t, np.zeros_like(t)))
+    vertical = np.column_stack((np.zeros_like(t), -t))
+    return interior, horizontal, vertical
+
+
+def summarize_lifting_diagnostics(interior, w_interior, w_gamma,
+                                  interior_n, boundary_n):
+    """Compute sampled extrema and an arc-length L2 quadrature on Gamma.
+
+    w_gamma has shape (2, boundary_n + 1), one row per unit-length segment.
+    No finite grid certifies positivity or a supremum over the continuum.
+    """
+    w_interior = np.asarray(w_interior, dtype=np.float64).reshape(-1)
+    w_gamma = np.asarray(w_gamma, dtype=np.float64)
+    if w_interior.size != len(interior) or w_gamma.shape != (2, boundary_n + 1):
+        raise ValueError("Diagnostic values do not match the evaluation grids.")
+    if not (np.isfinite(w_interior).all() and np.isfinite(w_gamma).all()):
+        raise ValueError("The lifting diagnostics contain NaN or infinite values.")
+    i_min = int(np.argmin(w_interior))
+    squared = w_gamma ** 2
+    # Both segments have length one, so their quadrature spacing is 1/boundary_n.
+    integral = float(np.sum(
+        0.5 * squared[:, 0] + squared[:, 1:-1].sum(axis=1)
+        + 0.5 * squared[:, -1]
+    ) / boundary_n)
+    return {
+        "interior_grid_spacing": 1.0 / interior_n,
+        "interior_points": int(len(interior)),
+        "interior_min": float(w_interior[i_min]),
+        "interior_min_point": interior[i_min].tolist(),
+        "interior_negative_count": int(np.count_nonzero(w_interior < 0.0)),
+        "interior_nonpositive_count": int(np.count_nonzero(w_interior <= 0.0)),
+        "gamma_intervals_per_segment": int(boundary_n),
+        "gamma_nodes_per_segment": int(boundary_n + 1),
+        "gamma_quadrature": "Composite trapezoidal rule; two unit-length segments",
+        "gamma_l2_residual": float(np.sqrt(integral)),
+        "gamma_rms_residual": float(np.sqrt(integral / 2.0)),
+        "gamma_max_abs_sampled": float(np.max(np.abs(w_gamma))),
+        "interpretation": (
+            "The interior minimum and boundary maximum are sampled extrema, "
+            "not certified continuum bounds. The L2 residual is a quadrature estimate."
+        ),
+    }
+
+
+def report_lifting_diagnostics(model_boundary, interior_n=256, boundary_n=4096,
+                               batch_size=8192, output_dir="data"):
+    """Evaluate w = (1-x^2)(1-y^2) N_b, print diagnostics, and save JSON.
+
+    Can also be called on an already trained/loaded lifting network. Evaluation
+    uses the network's device and dtype; reductions are accumulated in float64.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive.")
+    interior, horizontal, vertical = lifting_diagnostic_points(interior_n, boundary_n)
+    parameter = next(model_boundary.parameters())
+    was_training = model_boundary.training
+    model_boundary.eval()
+
+    def evaluate(points):
+        values = []
+        with torch.no_grad():
+            for start in range(0, len(points), batch_size):
+                batch = torch.as_tensor(points[start:start + batch_size],
+                                        device=parameter.device, dtype=parameter.dtype)
+                values.append(boundary_function(batch, model_boundary)
+                              .detach().cpu().numpy().reshape(-1))
+        return np.concatenate(values)
+
+    try:
+        w_interior = evaluate(interior)
+        w_gamma = np.stack((evaluate(horizontal), evaluate(vertical)))
+    finally:
+        model_boundary.train(was_training)
+
+    diagnostics = summarize_lifting_diagnostics(
+        interior, w_interior, w_gamma, interior_n, boundary_n)
+    diagnostics["evaluation_dtype"] = str(parameter.dtype)
+    diagnostics["evaluation_device"] = str(parameter.device)
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "lifting_diagnostics.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(diagnostics, handle, indent=2, allow_nan=False)
+        handle.write("\n")
+
+    print("\nLearned lifting function diagnostics (after lifting training)")
+    print(f"  Interior: {len(interior)} points, spacing h = 1/{interior_n}")
+    print(f"  Sampled interior minimum: {diagnostics['interior_min']:.8e}")
+    print(f"  Minimum location: {diagnostics['interior_min_point']}")
+    print(f"  Negative interior samples: {diagnostics['interior_negative_count']}")
+    print(f"  Nonpositive interior samples: {diagnostics['interior_nonpositive_count']}")
+    print(f"  Gamma: {boundary_n + 1} nodes on each unit-length segment")
+    print(f"  Gamma L2 residual (quadrature): {diagnostics['gamma_l2_residual']:.8e}")
+    print(f"  Gamma RMS residual: {diagnostics['gamma_rms_residual']:.8e}")
+    print(f"  Gamma maximum absolute residual (sampled): "
+          f"{diagnostics['gamma_max_abs_sampled']:.8e}")
+    print("  These finite-grid checks do not certify continuum positivity/feasibility.")
+    print(f"  Saved diagnostics to {path}\n")
+    return diagnostics
+
+
 
 def generate_data(n_samples=50):
     n = n_samples + random.randint(1, 50)
@@ -244,7 +362,8 @@ def loss_function(y_pred, u, y_d):
     return total_loss, data_loss, reg_loss
 
 
-def train_model(n_samples=10000, epochs=5000, lr=1e-3):
+def train_model(n_samples=50, epochs=5000, lr=1e-3,
+                boundary_epochs=10000, lifting_only=False, plot_every=200):
     model_boundary = ResNetFunction(
         input_dim=2,
         output_dim=1,
@@ -257,7 +376,7 @@ def train_model(n_samples=10000, epochs=5000, lr=1e-3):
         {'params': model_boundary.parameters(), 'lr': 1e-3},])
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer_b, step_size=500, gamma=0.8)
 
-    for epoch in range(10000):
+    for epoch in range(boundary_epochs):
         x_train = generate_data(n_samples).to(device)
         dis_train = lshape_boundary_distance(x_train)
         boundry_nn = boundary_function(x_train,model_boundary)
@@ -275,6 +394,23 @@ def train_model(n_samples=10000, epochs=5000, lr=1e-3):
         if epoch % 200 == 0:
             print('loss_b',loss_b,'loss_in',loss_in)
 
+    # The lifting is now fixed. Freezing parameters still permits spatial
+    # derivatives with respect to x during the subsequent PDE training.
+    model_boundary.eval()
+    model_boundary.requires_grad_(False)
+    model_boundary.zero_grad(set_to_none=True)
+    diagnostics = report_lifting_diagnostics(model_boundary)
+    torch.save({
+        'model_state_dict': {key: value.detach().cpu()
+                             for key, value in model_boundary.state_dict().items()},
+        'architecture': {'input_dim': 2, 'output_dim': 1, 'hidden_dim': 64,
+                         'num_layers': 2, 'activation_fn': 'Tanh'},
+        'boundary_epochs': boundary_epochs,
+        'diagnostics': diagnostics,
+    }, "data/lifting_model.pth")
+    if lifting_only:
+        return None, model_boundary, None
+
 
     model = ResNetFunction(
         input_dim=2,
@@ -283,10 +419,10 @@ def train_model(n_samples=10000, epochs=5000, lr=1e-3):
         num_layers=3,
         activation_fn=nn.Tanh,
     ).to(device)
-    gamma = torch.tensor(0.0, requires_grad=True)
+    gamma = torch.tensor(0.0, device=device, requires_grad=True)
 
     optimizer = torch.optim.Adam([
-        {'params': model.parameters(), 'lr': 1e-3},
+        {'params': model.parameters(), 'lr': lr},
         {'params': gamma, 'lr': 1e-2}
     ])
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=500, gamma=0.8)
@@ -326,10 +462,11 @@ def train_model(n_samples=10000, epochs=5000, lr=1e-3):
 
             print(f'gamma"{gamma:6f}')
 
-            y_pred, u_pred = evaluate_model(model,model_boundary,gamma)
+        if plot_every and epoch % plot_every == 0:
+            y_pred, u_pred = evaluate_model(model, model_boundary, gamma)
             professional_plot(y_pred, u_pred)
 
-    return model
+    return model, model_boundary, gamma
 
 
 def evaluate_model(model,model_b,gamma):
@@ -347,15 +484,15 @@ def evaluate_model(model,model_b,gamma):
     XX_2 = torch.stack([X_2.reshape(-1), Y_2.reshape(-1)], dim=1)
 
     XX = torch.cat([XX_1, XX_2], dim=0)
-    XX = torch.cat([XX_1, XX_2], dim=0)
-    x_test = torch.tensor(XX, requires_grad=True)
+    x_test = XX.detach().clone().to(device).requires_grad_(True)
+    x_cpu = XX.detach().cpu()
 
     with torch.enable_grad():
 
-        y_n = y_theta(x_test.to(device), model,model_b)
+        y_n = y_theta(x_test, model,model_b)
         lap_y_n = laplacian(y_n, x_test)
-        y_pred = y_n + gamma * singular_part(x_test.detach().cpu()).to(device)
-        u_pred = -lap_y_n - gamma * Deltap(x_test.detach().cpu())-f_r(x_test.detach().cpu())
+        y_pred = y_n + gamma * singular_part(x_cpu).to(device)
+        u_pred = -lap_y_n - gamma * Deltap(x_cpu).to(device)-f_r(x_cpu).to(device)
 
 
 
@@ -380,6 +517,7 @@ def professional_plot(y_pred, u_pred):
     y_np = XX[:, 1].numpy()
     y_true = y_exact(XX)
     u_true = rate * y_true
+    os.makedirs("data", exist_ok=True)
     filename = f"data/ERNM_singularity.pth"
     torch.save({
         'U_pred': u_pred.detach().cpu(),
@@ -468,17 +606,18 @@ def professional_plot(y_pred, u_pred):
 
 
 if __name__ == "__main__":
-    model, train_losses, data_losses, reg_losses, control_errors = train_model(
-        n_samples=50, epochs=20000, lr=1e-3
+    parser = argparse.ArgumentParser(description="Singularity-enriched neural method")
+    parser.add_argument("--lifting-only", action="store_true",
+                        help="Train the lifting and report diagnostics, then stop.")
+    args = parser.parse_args()
+    model, model_boundary, gamma = train_model(
+        n_samples=50, epochs=20000, lr=1e-3, lifting_only=args.lifting_only
     )
 
-    y_pred, u_pred = evaluate_model(model)
-
-    filename = f"data/CNP_state_bound.pth"
-    torch.save({
-
-        'U_pred': u_pred.reshape(256, 256).detach().cpu(),
-        'Y_pred': y_pred.reshape(256, 256).detach().cpu(),
-    }, filename)
+    if model is not None:
+        y_pred, u_pred = evaluate_model(model, model_boundary, gamma)
+        # Saves the unstructured L-shaped grid and its predictions, without
+        # attempting to reshape it into a full rectangular grid.
+        professional_plot(y_pred, u_pred)
 
     print('finished')
